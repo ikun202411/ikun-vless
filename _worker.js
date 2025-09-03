@@ -1,5 +1,12 @@
 import { connect } from 'cloudflare:sockets';
 
+//🔧 参数调节
+//CONNECT_TIMEOUT_MS
+//如果你发现 Worker 日志里频繁报 timeout 或 CPU 使用过高，可以适当调小（如 1500ms）。
+//如果目标服务器响应较慢，可以调大（如 5000ms），但可能增加 Worker 占用。
+//WS_BATCH_SIZE
+//现在是 10 条消息合并一次写入，减少了系统调用，但批次越大，单次处理越重。
+//如果感觉 CPU 占用高，可以改成 5；如果带宽利用率低，可以改成 20。
 // ==================== 可调参数 ====================
 const CONNECT_TIMEOUT_MS = 3000; // TCP 连接超时（毫秒）
 const WS_BATCH_SIZE = 10;       // WS->Socket 合并消息数量，可根据负载调整
