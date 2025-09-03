@@ -81,11 +81,6 @@ https://your-worker.workers.dev/123456
 https://your-worker.workers.dev/123456/vless
 ```
 
-### 动态修改代理IP
-```
-https://your-worker.workers.dev/123456?proxyip=new.proxy.com:443
-```
-
 ## 🔒 安全说明
 
 - UUID 验证确保访问安全
