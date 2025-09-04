@@ -81,6 +81,17 @@ https://your-worker.workers.dev/123456
 https://your-worker.workers.dev/123456/vless
 ```
 
+### 支持URL修改参数
+```
+https://your-worker.workers.dev/123456/vless?proxyip=1.2.3.4:443
+```
+可以支持的参数有?proxyip,?socks5,?gsocks5(全局socks5）
+
+也可以组合
+```
+https://your-worker.workers.dev/123456/vless?proxyip=1.2.3.4:443&socks5=socks5://user:pass@host:port
+```
+
 ## 🔒 安全说明
 
 - UUID 验证确保访问安全
