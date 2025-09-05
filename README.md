@@ -46,7 +46,7 @@
 | `URL` | ❌ | `example.com` | 非 WebSocket 请求的回退地址 |
 | `BESTIPS` | ❌ | 见下方 | 优选 IP 列表 |
 | `PROXYIP` | ❌ | - | 代理 IP，格式：`host:port` |
-| `SOCKS5` | ❌ | - | SOCKS5 代理配置 |
+| `SOCKS5` | ❌ | - | SOCKS5 格式：socks5://user:pass@host:port |
 | `GSOCKS5` | ❌ | `false` | 全局 SOCKS5 开关 |
 
 （ps.当socks5与proxyip同时设置时，则优先使用socks5）
