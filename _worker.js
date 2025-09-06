@@ -1,31 +1,19 @@
 import { connect } from 'cloudflare:sockets';
-/* ===================== 实现代码 ===================== */
-
 export default {
   async fetch(req, env) {
-    // ------------------- 1. 读取并规范化环境变量 -------------------
     const USER_ID = env?.USERID || env?.USER_ID || env?.userid || 'ikun';
     const UUID = (env?.UUID || env?.uuid || '4ba0eec8-25e1-4ab3-b188-fd8a70b53984').toLowerCase();
     const NODE_NAME = env?.NODE_NAME || env?.NODENAME || 'IKUN-vless';
     const PUBLIC_URL = env?.URL || env?.url || 'example.com';
-
-    // BESTIPS 支持换行或逗号分隔
     const BESTIPS_RAW = env?.BESTIPS || env?.bestips || env?.BEST_IPS || [
       'ip.sb',
       'www.visa.com',
-      'developers.cloudflare.com',
-      'ikun.glimmer.cf.090227.xyz'
+      'developers.cloudflare.com'
     ];
-    const BESTIPS = String(BESTIPS_RAW)
-      .split(/\r?\n|,/)
-      .map(s => s.trim())
-      .filter(Boolean);
-
+    const BESTIPS = String(BESTIPS_RAW).split(/\r?\n|,/).map(s => s.trim()).filter(Boolean);
     const PROXY_IP_ENV = env?.PROXYIP || env?.proxyip || '';
     const SOCKS5_ENV = env?.SOCKS5 || env?.socks5 || '';
     const GSOCKS5_ENV = String(env?.GSOCKS5 || env?.gsocks5 || 'false').toLowerCase() === 'true';
-
-    // 预处理 UUID 为字节数组（用于校验）
     let uuidBytes;
     try {
       const hex = UUID.replace(/-/g, '');
@@ -35,183 +23,89 @@ export default {
       uuidBytes = new Uint8Array(16);
     }
 
-    // -------------------  解析请求 URL / Query / Path（公共信息） -------------------
     const urlObj = new URL(req.url);
-    const reqHost = urlObj.hostname; // 部署域名（请求 Host），**作为 sni/host**
+    const reqHost = urlObj.hostname;
     const q = urlObj.searchParams;
     const defaultPort = 443;
-    const pathCandidate = urlObj.pathname.slice(1) || null; // 用于从 path 解析 socks5
 
-    // ------------------- socks5 字符串解析函数 -------------------
-    function parseSocksString(s) {
-      if (!s) return null;
+    const pathRaw = decodeURIComponent(urlObj.pathname.slice(1) || '');
+
+    // 允许的四种写法标志
+    let socksFrom = null;            
+    let isGlobalByPath = false;      
+    let originScheme = null;        
+    // 仅：/socks5=user:pass@host:port  （不全局）
+    if (pathRaw.startsWith('socks5=')) {
+      socksFrom = parseSocksString(pathRaw.slice('socks5='.length));
+      originScheme = 'socks5-param';
+    }
+    // 仅：/socks://BASE64@host:port   （全局）
+    else if (pathRaw.startsWith('socks://')) {
+      socksFrom = parseSocksString(pathRaw.slice('socks://'.length), /*isBase64User=*/true);
+      isGlobalByPath = true;
+      originScheme = 'socks';
+    }
+    // 仅：/socks5://user:pass@host:port  （全局）
+    else if (pathRaw.startsWith('socks5://')) {
+      socksFrom = parseSocksString(pathRaw.slice('socks5://'.length));
+      isGlobalByPath = true;
+      originScheme = 'socks5';
+    }
+
+    // 仅：/?socks5=user:pass@host:port  （不全局）
+    let socksFromQuery = null;
+    if (q.has('socks5')) {
+      socksFromQuery = parseSocksString(q.get('socks5'));
+      if (socksFromQuery) originScheme = 'socks5-param';
+    }
+
+    // 最终 socks 字符串来源：Query 优先于 Path，再优先于 Env
+    const socksFinal = socksFromQuery || socksFrom || (SOCKS5_ENV ? parseSocksString(SOCKS5_ENV) : null);
+    let globalSocks = Boolean((isGlobalByPath || GSOCKS5_ENV) && socksFinal);
+    const PROXY_IP = q.get('proxyip') || PROXY_IP_ENV || '';
+
+    function parseSocksString(input, isBase64User = false) {
+      if (!input) return null;
       try {
-        let input = String(s).trim();
-        if (input.includes('=') && !/^socks5?:\/\//i.test(input)) input = input.slice(input.indexOf('=') + 1);
+        let user = '', pass = '', host = '', port = 1080;
+        let left = String(input).trim();
 
-        // 支持多种协议前缀：socks5:// socks:// s5:// gs5:// gsocks5://
-        if (/^socks5?:\/\//i.test(input)) {
-          if (input.toLowerCase().startsWith('socks5://')) input = input.slice(9);
-          else input = input.slice(8);
-        } else if (/^socks:\/\//i.test(input)) {
-          input = input.slice(8);
-        } else if (input.toLowerCase().startsWith('s5://')) {
-          input = input.slice(5);
-        } else if (input.toLowerCase().startsWith('gs5://')) {
-          input = input.slice(6);
-        } else if (input.toLowerCase().startsWith('gsocks5://')) {
-          input = input.slice(10);
-        } else if (input.toLowerCase().startsWith('gsocks://')) {
-          input = input.slice(9);
+        // 期望格式： [user[:pass]]@host:port
+        if (!left.includes('@')) return null;
+        const [userPart, serverPart] = left.split('@');
+
+        if (isBase64User) {
+          // /socks://BASE64(user:pass)@host:port
+          const dec = atob(userPart);
+          const idx = dec.indexOf(':');
+          if (idx >= 0) { user = dec.slice(0, idx); pass = dec.slice(idx + 1); }
+          else { user = dec; pass = ''; }
+        } else {
+          // 普通 user[:pass]
+          const idx = userPart.indexOf(':');
+          if (idx >= 0) { user = userPart.slice(0, idx); pass = userPart.slice(idx + 1); }
+          else { user = userPart; pass = ''; }
         }
 
-        let user = '', pass = '';
-        let hostPort = input;
-        if (input.includes('@')) {
-          const [userPart, serverPart] = input.split('@');
-          if (/^[A-Za-z0-9+/=]+$/.test(userPart) && !userPart.includes(':')) {
-            try {
-              const dec = atob(userPart);
-              if (dec.includes(':')) [user, pass] = dec.split(':');
-              else { user = dec; pass = ''; }
-            } catch {
-              if (userPart.includes(':')) [user, pass] = userPart.split(':');
-              else user = userPart;
-            }
-          } else {
-            if (userPart.includes(':')) [user, pass] = userPart.split(':');
-            else user = userPart;
-          }
-          hostPort = serverPart;
-        }
-        const [host, portRaw] = hostPort.split(':');
-        const port = portRaw ? parseInt(portRaw, 10) : 1080;
-        return { host, port, user, pass, raw: s };
+        const sp = serverPart.split(':');
+        host = sp[0];
+        port = sp[1] ? parseInt(sp[1], 10) : 1080;
+        if (!host || Number.isNaN(port)) return null;
+
+        return { host, port, user, pass, raw: input };
       } catch {
         return null;
       }
     }
 
-    // -------------------  从 Query / Path / Env 决定 socks5 与 gsocks 请求意图 -------------------
-    // 支持多种 query 名称：s5 / socks5 (提供 socks 配置但不自动开全局)
-    // 以及 gs5 / gsocks5 (用于请求开启全局，并且可能携带 socks 字符串)
-    let socksParamQuery = null;
-    let requestedGlobalQuery = false;
-    let socksSourceIsGs = false; // 记录 socks 字符串是否来自 gs5/gsocks5（query 或 path）
-
-    // 1) 首先优先查找非全局的 socks 参数（s5 或 socks5）
-    if (q.has('s5')) socksParamQuery = q.get('s5');
-    else if (q.has('socks5')) socksParamQuery = q.get('socks5');
-
-    // 2) 如果没有找到非全局 socks 参数，再检查 gs5/gsocks5（它们可能携带 socks 字符串，也可能仅为 true）
-    if (!socksParamQuery) {
-      if (q.has('gs5')) {
-        const v = q.get('gs5');
-        if (v && v.toLowerCase() !== 'true' && v.toLowerCase() !== 'false') {
-          socksParamQuery = v;
-          socksSourceIsGs = true; // 来源是 gs5，记下标志
-        }
-        requestedGlobalQuery = true;
-      } else if (q.has('gsocks5')) {
-        const v = q.get('gsocks5');
-        if (v && v.toLowerCase() !== 'true' && v.toLowerCase() !== 'false') {
-          socksParamQuery = v;
-          socksSourceIsGs = true; // 来源是 gsocks5
-        }
-        requestedGlobalQuery = true;
-      }
-    } else {
-      // 如果已有 s5/socks5 参数，但同时也传了 gs5/gsocks5 -> 那也算请求开启全局（如果 gs* 存在）
-      if (q.has('gs5') || q.has('gsocks5')) requestedGlobalQuery = true;
-      // 注意：如果同时传了 s5= 和 gs5=xxx 的极端情况，上面的逻辑优先选 s5=（非全局）
-    }
-
-    // 解析 path 中的 s5 / socks5 / gs5 / gsocks5
-    let socksFromPath = null;
-    let pathGlobalActivate = false;
-    if (pathCandidate) {
-      const low = pathCandidate.toLowerCase();
-      if (low.includes('gs5=')) {
-        const idx = pathCandidate.toLowerCase().indexOf('gs5=');
-        const raw = decodeURIComponent(pathCandidate.slice(idx));
-        const maybe = raw.split('=')[1] || null;
-        if (maybe) socksFromPath = maybe;
-        pathGlobalActivate = true;
-        socksSourceIsGs = true; // 来源为 gs5
-      } else if (low.includes('gsocks5=')) {
-        const idx = pathCandidate.toLowerCase().indexOf('gsocks5=');
-        const raw = decodeURIComponent(pathCandidate.slice(idx));
-        const maybe = raw.split('=')[1] || null;
-        if (maybe) socksFromPath = maybe;
-        pathGlobalActivate = true;
-        socksSourceIsGs = true; // 来源为 gsocks5
-      } else if (low.includes('s5=')) {
-        const idx = pathCandidate.toLowerCase().indexOf('s5=');
-        const raw = decodeURIComponent(pathCandidate.slice(idx));
-        const maybe = raw.split('=')[1] || null;
-        if (maybe) socksFromPath = maybe;
-      } else if (low.includes('socks5=')) {
-        const idx = pathCandidate.toLowerCase().indexOf('socks5=');
-        const raw = decodeURIComponent(pathCandidate.slice(idx));
-        const maybe = raw.split('=')[1] || null;
-        if (maybe) socksFromPath = maybe;
-      } else if (/^gs5:\/\//i.test(pathCandidate)) {
-        pathGlobalActivate = true;
-        socksFromPath = pathCandidate.replace(/^gs5:\/\//i, '');
-        socksSourceIsGs = true;
-      } else if (/^gsocks5:\/\//i.test(pathCandidate)) {
-        pathGlobalActivate = true;
-        socksFromPath = pathCandidate.replace(/^gsocks5:\/\//i, '');
-        socksSourceIsGs = true;
-      } else if (/^s5:\/\//i.test(pathCandidate)) {
-        socksFromPath = pathCandidate.replace(/^s5:\/\//i, '');
-      } else if (/^socks5:\/\//i.test(pathCandidate)) {
-        socksFromPath = pathCandidate.replace(/^socks5:\/\//i, '');
-      } else if (pathCandidate.includes('@') && pathCandidate.toLowerCase().includes('socks')) {
-        const p = pathCandidate.toLowerCase().indexOf('socks');
-        const seg = pathCandidate.slice(p);
-        const idx = seg.indexOf('@');
-        if (idx > 0) socksFromPath = seg;
-      }
-    }
-
-    // 最终 socks 原始字符串 优先级 Query(s5/socks5) > Path (s5/socks5/gs5/gsocks5) > Env
-    const socksRawFinal = socksParamQuery || socksFromPath || SOCKS5_ENV || null;
-    const socks5 = parseSocksString(socksRawFinal);
-
-    // gsocks5 现在兼容 ?gs5 and ?gsocks5，也支持 env GSOCKS5；pathGlobalActivate 也会生效
-    const gsocksQuery = q.get('gs5') || q.get('gsocks5') || null;
-    const requestedGlobal = GSOCKS5_ENV || requestedGlobalQuery || (gsocksQuery && gsocksQuery.toLowerCase() === 'true') || pathGlobalActivate;
-    // 初始决定 globalSocks：只有“请求开启”且存在 socks5 配置才允许初始为 true
-    let globalSocks = Boolean(requestedGlobal && socks5);
-
-    const PROXY_IP = q.get('proxyip') || PROXY_IP_ENV || null;
-
-    // ------------------- 构造 vless path 片段（包含 proxyip 与 s5/gs5） -------------------
-    function buildPathForVless(query) {
-      const parts = [];
-      const proxy = query.get('proxyip') || PROXY_IP;
-      // 兼容 query 参数名 s5 / socks5 / gs5 / gsocks5；并根据 socksSourceIsGs 决定使用 s5= 或 gs5=
-      const s5val = query.get('s5') || query.get('socks5') || socksRawFinal;
-      if (proxy) parts.push('proxyip=' + encodeURIComponent(proxy));
-      if (s5val) {
-        if (socksSourceIsGs) {
-          parts.push('gs5=' + encodeURIComponent(s5val)); // 当 socks 来自 gs5 时，使用 gs5= 保留“全局”语义
-        } else {
-          parts.push('s5=' + encodeURIComponent(s5val));
-        }
-      }
-      return '/?' + parts.join('&');
-    }
-
-    // ------------------- WebSocket 代理主逻辑（优先处理 WebSocket） -------------------
     if (req.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
       const [client, ws] = Object.values(new WebSocketPair());
       ws.accept();
 
-      let remote = null, udpWriter = null, isDNS = false;
+      let remote = null;
+      let udpWriter = null;
+      let isDNS = false;
 
-      // socks5 连接函数
       const socks5Connect = async (s5, targetHost, targetPort) => {
         if (!s5 || !s5.host) throw new Error('no-socks5-config');
         const s = connect({ hostname: s5.host, port: s5.port });
@@ -220,12 +114,13 @@ export default {
         const r = s.readable.getReader();
         try {
           if (s5.user) {
-            await w.write(new Uint8Array([5, 2, 0, 2]));
+            await w.write(new Uint8Array([5, 2, 0, 2])); // no-auth & user/pass
           } else {
-            await w.write(new Uint8Array([5, 1, 0]));
+            await w.write(new Uint8Array([5, 1, 0]));    // no-auth
           }
           const auth = (await r.read()).value;
           if (!auth || auth[0] !== 5) throw new Error('s5bad');
+
           if (auth[1] === 2 && s5.user) {
             const ub = new TextEncoder().encode(s5.user);
             const pb = new TextEncoder().encode(s5.pass || '');
@@ -235,10 +130,12 @@ export default {
           } else if (auth[1] !== 0 && !(auth[1] === 2 && s5.user)) {
             throw new Error('s5noauth');
           }
+
           const domain = new TextEncoder().encode(targetHost);
-          await w.write(new Uint8Array([5, 1, 0, 3, domain.length, ...domain, targetPort >> 8, targetPort & 255]));
+          await w.write(new Uint8Array([5, 1, 0, 3, domain.length, ...domain, targetPort >> 8, targetPort & 0xff]));
           const cresp = (await r.read()).value;
           if (!cresp || cresp[1] !== 0) throw new Error('s5fail');
+
           w.releaseLock(); r.releaseLock();
           return s;
         } catch (e) {
@@ -248,87 +145,82 @@ export default {
         }
       };
 
-      // WebSocket 消息流入管道
       new ReadableStream({
-        start(ctrl) {
+        start(controller) {
           ws.addEventListener('message', e => {
             if (e.data instanceof ArrayBuffer || ArrayBuffer.isView(e.data)) {
-              ctrl.enqueue(e.data);
+              controller.enqueue(e.data);
             } else if (typeof e.data === 'string') {
               try {
                 const bin = Uint8Array.from(atob(e.data.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
-                ctrl.enqueue(bin.buffer);
+                controller.enqueue(bin.buffer);
               } catch {}
             }
           });
-          ws.addEventListener('close', () => { try { remote?.close(); } catch {} ; ctrl.close(); });
-          ws.addEventListener('error', () => { try { remote?.close(); } catch {} ; ctrl.error(); });
+          ws.addEventListener('close', () => { try { remote?.close(); } catch {} ; controller.close(); });
+          ws.addEventListener('error', () => { try { remote?.close(); } catch {} ; controller.error(); });
 
           const early = req.headers.get('sec-websocket-protocol');
           if (early) {
             try {
-              ctrl.enqueue(Uint8Array.from(atob(early.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0)).buffer);
+              controller.enqueue(Uint8Array.from(atob(early.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0)).buffer);
             } catch {}
           }
         }
       }).pipeTo(new WritableStream({
-        async write(data) {
-          if (isDNS) return udpWriter?.write(data);
+        async write(chunk) {
+          if (isDNS) { return udpWriter?.write(chunk); }
 
           if (remote) {
             const w = remote.writable.getWriter();
-            await w.write(data);
+            await w.write(chunk);
             w.releaseLock();
             return;
           }
 
-          if (data.byteLength < 24) return;
+          if (chunk.byteLength < 24) return;
 
-          // UUID 校验（字节比较）
-          const uuidRecv = new Uint8Array(data.slice(1, 17));
-          for (let i = 0; i < 16; i++) {
-            if (uuidRecv[i] !== uuidBytes[i]) return;
-          }
+          const uuidRecv = new Uint8Array(chunk.slice(1, 17));
+          for (let i = 0; i < 16; i++) if (uuidRecv[i] !== uuidBytes[i]) return;
 
-          // 解析 VLESS 头
-          const view = new DataView(data);
+          const view = new DataView(chunk);
           const optLen = view.getUint8(17);
           const cmd = view.getUint8(18 + optLen);
           if (cmd !== 1 && cmd !== 2) return;
 
           let pos = 19 + optLen;
           const port = view.getUint16(pos);
-          const type = view.getUint8(pos + 2);
+          const addrType = view.getUint8(pos + 2);
           pos += 3;
 
           let addr = '';
-          if (type === 1) {
+          if (addrType === 1) {
             addr = `${view.getUint8(pos)}.${view.getUint8(pos + 1)}.${view.getUint8(pos + 2)}.${view.getUint8(pos + 3)}`;
             pos += 4;
-          } else if (type === 2) {
+          } else if (addrType === 2) {
             const len = view.getUint8(pos++);
-            addr = new TextDecoder().decode(data.slice(pos, pos + len));
+            addr = new TextDecoder().decode(chunk.slice(pos, pos + len));
             pos += len;
-          } else if (type === 3) {
+          } else if (addrType === 3) {
             const parts = [];
             for (let i = 0; i < 8; i++, pos += 2) parts.push(view.getUint16(pos).toString(16));
             addr = parts.join(':');
           } else return;
 
-          const header = new Uint8Array([data[0], 0]);
-          const payload = data.slice(pos);
+          const header = new Uint8Array([chunk[0], 0]);
+          const payload = chunk.slice(pos);
 
-          // DNS over DoH（cmd==2 && port==53）
+          // UDP DNS（DoH）
           if (cmd === 2) {
             if (port !== 53) return;
             isDNS = true;
 
             let sent = false;
             const { readable, writable } = new TransformStream({
-              transform(chunk, ctrl) {
-                for (let i = 0; i < chunk.byteLength;) {
-                  const len = new DataView(chunk.slice(i, i + 2)).getUint16(0);
-                  ctrl.enqueue(chunk.slice(i + 2, i + 2 + len));
+              transform(buf, ctrl) {
+                for (let i = 0; i < buf.byteLength;) {
+                  const len = new DataView(buf.slice(i, i + 2)).getUint16(0);
+                  ctrl.enqueue(buf.slice(i + 2, i + 2 + len));
                   i += 2 + len;
                 }
               }
@@ -355,60 +247,43 @@ export default {
             return udpWriter.write(payload);
           }
 
-          // ====== 连接策略（直连 -> socks5 回退 -> proxyip 回退；若 requested 全局 socks，则优先尝试） ======
           let sock = null;
 
-          // 若请求开启 globalSocks（且上面已初步判断有 socks5），优先尝试
           if (globalSocks) {
             try {
-              sock = await socks5Connect(socks5, addr, port);
-            } catch (e) {
-              // 全局 socks5 失败：自动关闭 globalSocks，并降级到普通顺序（允许 proxyip 兜底）
-              try { sock && sock.close(); } catch {}
+              sock = await socks5Connect(socksFinal, addr, port);
+            } catch {
+              try { sock?.close(); } catch {}
               sock = null;
-              globalSocks = false;
+              globalSocks = false; // 降级
             }
           }
 
-          // 普通顺序（如果未建立连接）
           if (!sock) {
-            // 1) 直连
             try {
               const s = connect({ hostname: addr, port });
               await s.opened;
               sock = s;
-            } catch (e) {
-              try { sock && sock.close(); } catch {}
-              sock = null;
-            }
+            } catch { try { sock?.close(); } catch {}; sock = null; }
 
-            // 2) socks5 回退（若有配置）
-            if (!sock && socks5) {
+            if (!sock && socksFinal) {
               try {
-                sock = await socks5Connect(socks5, addr, port);
-              } catch (e) {
-                try { sock && sock.close(); } catch {}
-                sock = null;
-              }
+                sock = await socks5Connect(socksFinal, addr, port);
+              } catch { try { sock?.close(); } catch {}; sock = null; }
             }
-
-            // 3) proxyip 回退（若提供）
             if (!sock && PROXY_IP) {
               try {
                 const [ph, pp] = PROXY_IP.split(':');
                 const s = connect({ hostname: ph, port: +pp || port });
                 await s.opened;
                 sock = s;
-              } catch (e) {
-                try { sock && sock.close(); } catch {}
-                sock = null;
-              }
+              } catch { try { sock?.close(); } catch {}; sock = null; }
             }
           }
 
           if (!sock) return;
 
-          // 成功：写入 payload 并将远端返回通过 ws 发回
+          // 首包 + 回流
           remote = sock;
           const w = sock.writable.getWriter();
           await w.write(payload);
@@ -416,9 +291,9 @@ export default {
 
           let sent = false;
           sock.readable.pipeTo(new WritableStream({
-            write(chunk) {
+            write(chunk2) {
               if (ws.readyState === 1) {
-                ws.send(sent ? chunk : new Uint8Array([ ...header, ...new Uint8Array(chunk) ]));
+                ws.send(sent ? chunk2 : new Uint8Array([ ...header, ...new Uint8Array(chunk2) ]));
                 sent = true;
               }
             },
@@ -431,29 +306,47 @@ export default {
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    // ------------------- 订阅接口 -------------------
-    // GET /USER_ID 返回纯文本订阅（每行一条 vless 链接）
     if (req.method === 'GET' && urlObj.pathname === `/${USER_ID}`) {
-      const pathForVless = buildPathForVless(q);
       const bestList = Array.from(BESTIPS);
       if (!bestList.includes(reqHost)) bestList.push(reqHost);
       const sniHost = reqHost;
 
-      const vlessLines = bestList.map(ip => {
-        let addr = ip;
-        let port = defaultPort;
+      const pathForVless = buildPathForVless();
+
+      function buildPathForVless() {
+        const parts = [];
+        if (PROXY_IP) parts.push('proxyip=' + encodeURIComponent(PROXY_IP));
+
+        if (socksFinal) {
+          if (isGlobalByPath || GSOCKS5_ENV) {
+            if (originScheme === 'socks') {
+              return '/' + (parts.length ? `?${parts.join('&')}` : '') + `socks://${encodeURIComponent(btoa(`${socksFinal.user || ''}${socksFinal.user !== undefined ? ':' : ''}${socksFinal.pass || ''}`))}@${socksFinal.host}:${socksFinal.port}`;
+            } else {
+              const creds = encodeURIComponent(`${socksFinal.user || ''}${socksFinal.user !== undefined ? ':' : ''}${socksFinal.pass || ''}`);
+              const suffix = `socks5://${creds}@${socksFinal.host}:${socksFinal.port}`;
+              return '/' + (parts.length ? `?${parts.join('&')}` : '') + suffix;
+            }
+          } else {
+            const creds = encodeURIComponent(`${socksFinal.user || ''}${socksFinal.user !== undefined ? ':' : ''}${socksFinal.pass || ''}`);
+            parts.push('socks5=' + `${creds}@${socksFinal.host}:${socksFinal.port}`);
+          }
+        }
+
+        return '/?' + parts.join('&');
+      }
+
+      const lines = BESTIPS.map(ip => {
+        let addr = ip, port = defaultPort;
         if (ip.includes(':')) {
-          const parts = ip.split(':');
-          addr = parts[0];
-          port = parts[1] || defaultPort;
+          const seg = ip.split(':');
+          addr = seg[0]; port = seg[1] || defaultPort;
         }
         return `vless://${UUID}@${addr}:${port}?encryption=none&security=tls&sni=${encodeURIComponent(sniHost)}&allowInsecure=1&type=ws&host=${encodeURIComponent(sniHost)}&path=${encodeURIComponent(pathForVless)}#${encodeURIComponent(NODE_NAME)}`;
       }).join('\n');
 
-      return new Response(vlessLines, { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+      return new Response(lines, { status: 200, headers: { 'content-type': 'text/plain; charset=utf-8' } });
     }
 
-    //  非 websocket 且非订阅路由：回退到 PUBLIC_URL 或 example.com -------------------
     const fallback = new URL(req.url);
     fallback.hostname = PUBLIC_URL || 'example.com';
     return fetch(new Request(fallback, req));
